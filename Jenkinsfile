@@ -70,7 +70,8 @@ pipeline {
                 dir('app') {
                     sh 'npm install'
                     script {
-                        docker.build("yaramprasanthi/nodeapp:${env.CLUSTER_NAME}")
+                        def tag = env.WORKSPACE_ENV   // tag = dev, staging, prod
+                		docker.build("yaramprasanthi/nodeapp:${tag}")
                     }
                 }
             }
@@ -79,8 +80,9 @@ pipeline {
         stage('Push Docker Image') {
             steps {
                 script {
-                    docker.withRegistry('', 'dockerhub-creds') {
-                        docker.image("yaramprasanthi/nodeapp:${env.CLUSTER_NAME}").push()
+                    def tag = env.WORKSPACE_ENV
+            		docker.withRegistry('', 'dockerhub-creds') {
+                		docker.image("yaramprasanthi/nodeapp:${tag}").push()
                     }
                 }
             }
