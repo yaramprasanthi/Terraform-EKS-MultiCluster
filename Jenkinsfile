@@ -113,9 +113,12 @@ pipeline {
 
         stage('Deploy Node App to EKS') {
             steps {
-                dir('k8s/${params.ENVIRONMENT}') {
-                    kubectl --kubeconfig=/var/lib/jenkins/.kube/eks-${params.ENVIRONMENT}-config apply -f deployment.yaml
-                    kubectl --kubeconfig=/var/lib/jenkins/.kube/eks-${params.ENVIRONMENT}-config apply -f service.yaml
+                dir("k8s/${params.ENVIRONMENT}") {
+                    script {
+                        def kubeconfig = "/var/lib/jenkins/.kube/eks-${params.ENVIRONMENT}-config"
+                        sh "kubectl --kubeconfig=${kubeconfig} apply -f deployment.yaml"
+                        sh "kubectl --kubeconfig=${kubeconfig} apply -f service.yaml"
+                    }
                 }
             }
         }
@@ -129,8 +132,6 @@ pipeline {
                 }
             }
         }
-
-    }
 
     post {
         success { echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME}!" }
