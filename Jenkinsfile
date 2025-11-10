@@ -1,36 +1,104 @@
 pipeline {
-  agent any
-  environment { AWS_REGION = 'ap-south-1' }
+    agent any
 
-  stages {
-    stage('Checkout') {
-      steps {
-        git branch: "${BRANCH_NAME}", url: 'https://github.com/yaramprasanthi/Terraform-EKS-MultiClusters.git', credentialsId: 'git-creds'
-      }
+    environment {
+        // AWS credentials stored in Jenkins (replace with your credential IDs)
+        AWS_CREDENTIALS = credentials('aws-access-key')
+
+        TERRAFORM_WORKSPACE   = '' // will be set per branch
+        ENV_FOLDER            = '' // will be set per branch
     }
-    stage('Terraform Init') {
-      steps { sh "cd terraform/envs/${BRANCH_NAME} && terraform init" }
+
+    options {
+        // Keep only last 10 builds
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
     }
-    stage('Terraform Plan') {
-      steps { sh "cd terraform/envs/${BRANCH_NAME} && terraform plan -out=tfplan" }
+
+    stages {
+
+        stage('Set Environment') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME == 'dev') {
+                        ENV_FOLDER = 'terraform/envs/dev'
+                        TERRAFORM_WORKSPACE = 'dev'
+                    } else if (env.BRANCH_NAME == 'staging') {
+                        ENV_FOLDER = 'terraform/envs/staging'
+                        TERRAFORM_WORKSPACE = 'staging'
+                    } else if (env.BRANCH_NAME == 'main') {
+                        ENV_FOLDER = 'terraform/envs/production'
+                        TERRAFORM_WORKSPACE = 'prod'
+                    } else {
+                        error("Branch ${env.BRANCH_NAME} is not configured for deployment")
+                    }
+                    echo "Deploying branch '${env.BRANCH_NAME}' to environment '${ENV_FOLDER}'"
+                }
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                dir("${ENV_FOLDER}") {
+                    sh '''
+                        terraform init -input=false
+                        terraform workspace new ${TERRAFORM_WORKSPACE} || terraform workspace select ${TERRAFORM_WORKSPACE}
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                dir("${ENV_FOLDER}") {
+                    sh 'terraform plan -out=tfplan -input=false'
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            steps {
+                dir("${ENV_FOLDER}") {
+                    sh 'terraform apply -auto-approve tfplan'
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def imageTag = "${env.BRANCH_NAME}-nodeapp:latest"
+                    sh """
+                        docker build -t ${imageTag} app/
+                        docker tag ${imageTag} yaramprasanthi/${imageTag}
+                        echo "${DOCKERHUB_PASSWORD}" | docker login -u "yaramprasanthi" --password-stdin
+                        docker push yaramprasanthi/${imageTag}
+                    """
+                }
+            }
+        }
+
+        stage('Deploy Kubernetes') {
+            steps {
+                dir('k8s') {
+                    script {
+                        sh """
+                        kubectl apply -f deployment.yaml
+                        kubectl apply -f service.yaml
+                        """
+                    }
+                }
+            }
+        }
     }
-    stage('Terraform Apply') {
-      steps { sh "cd terraform/envs/${BRANCH_NAME} && terraform apply -auto-approve tfplan" }
+
+    post {
+        success {
+            echo "Deployment of branch ${env.BRANCH_NAME} completed successfully!"
+        }
+        failure {
+            echo "Deployment failed. Consider rollback."
+        }
     }
-    stage('Deploy App to EKS') {
-      steps {
-        sh "kubectl apply -f k8s/${BRANCH_NAME}/deployment.yaml"
-        sh "kubectl apply -f k8s/${BRANCH_NAME}/service.yaml"
-      }
-    }
-  }
-  post {
-    failure {
-      steps {
-        echo "Rollback triggered!"
-        sh "cd terraform/envs/${BRANCH_NAME} && terraform destroy -auto-approve"
-      }
-    }
-  }
 }
 
