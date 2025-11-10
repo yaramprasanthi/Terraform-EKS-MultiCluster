@@ -113,9 +113,9 @@ pipeline {
 
         stage('Deploy Node App to EKS') {
             steps {
-                dir('k8s') {
-                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
-                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
+                dir('k8s/${params.ENVIRONMENT}') {
+                    kubectl --kubeconfig=/var/lib/jenkins/.kube/eks-${params.ENVIRONMENT}-config apply -f deployment.yaml
+                    kubectl --kubeconfig=/var/lib/jenkins/.kube/eks-${params.ENVIRONMENT}-config apply -f service.yaml
                 }
             }
         }
@@ -123,8 +123,9 @@ pipeline {
         stage('Verify Deployment') {
             steps {
                 script {
-                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get pods -o wide"
-                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc"
+                    def kubeconfig = "/var/lib/jenkins/.kube/eks-${params.ENVIRONMENT}-config"
+                    sh "kubectl --kubeconfig=${kubeconfig} get pods -o wide"
+                    sh "kubectl --kubeconfig=${kubeconfig} get svc"
                 }
             }
         }
