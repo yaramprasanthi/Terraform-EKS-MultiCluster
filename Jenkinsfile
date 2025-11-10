@@ -1,14 +1,17 @@
 pipeline {
     agent any
 
+    // Parameters for dynamic configuration
     parameters {
         string(name: 'REGION', defaultValue: 'ap-south-1', description: 'AWS region for EKS cluster')
     }
 
     environment {
-        // Jenkins credentials (stored under "Manage Jenkins" → "Credentials")
+        // Global AWS credentials (Jenkins credential ID: 'aws-access-key')
         AWS_CREDENTIALS = credentials('aws-access-key')
         AWS_REGION = "${params.REGION}"
+
+        // DockerHub credentials (Jenkins credential ID: 'dockerhub-creds')
         DOCKERHUB_CRED = credentials('dockerhub-creds')
     }
 
@@ -39,12 +42,7 @@ pipeline {
                         error("Unknown branch: ${env.BRANCH_NAME}")
                     }
 
-                    echo """
-                    🌿 Branch: ${env.BRANCH_NAME}
-                    🏗️  Environment: ${env.WORKSPACE_ENV}
-                    ☁️  Cluster: ${env.CLUSTER_NAME}
-                    🌎 Region: ${env.AWS_REGION}
-                    """
+                    echo "Branch ${env.BRANCH_NAME} → Cluster ${env.CLUSTER_NAME}, Region ${env.AWS_REGION}"
                 }
             }
         }
@@ -53,20 +51,13 @@ pipeline {
             steps {
                 script {
                     def status = sh(
-                        script: """
-                            AWS_ACCESS_KEY_ID=${AWS_CREDENTIALS_USR} \
-                            AWS_SECRET_ACCESS_KEY=${AWS_CREDENTIALS_PSW} \
-                            aws eks describe-cluster --name ${env.CLUSTER_NAME} \
-                            --region ${env.AWS_REGION} \
-                            --query cluster.status --output text 2>/dev/null || echo NOT_FOUND
-                        """,
+                        script: "aws eks describe-cluster --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --query cluster.status --output text || echo NOT_FOUND",
                         returnStdout: true
                     ).trim()
-
                     if (status == 'NOT_FOUND') {
-                        echo "❌ Cluster ${env.CLUSTER_NAME} not found — creating new one."
+                        echo "Cluster ${env.CLUSTER_NAME} not found — will create a new one."
                     } else {
-                        echo "✅ Cluster ${env.CLUSTER_NAME} exists with status: ${status}"
+                        echo "Cluster ${env.CLUSTER_NAME} exists with status: ${status}"
                     }
                 }
             }
@@ -96,11 +87,8 @@ pipeline {
         stage('Terraform Init & Workspace') {
             steps {
                 dir("terraform/envs/${env.WORKSPACE_ENV}") {
-                    withEnv(["AWS_ACCESS_KEY_ID=${AWS_CREDENTIALS_USR}",
-                             "AWS_SECRET_ACCESS_KEY=${AWS_CREDENTIALS_PSW}"]) {
-                        sh 'terraform init -reconfigure'
-                        sh "terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}"
-                    }
+                    sh 'terraform init -reconfigure'
+                    sh "terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}"
                 }
             }
         }
@@ -108,14 +96,7 @@ pipeline {
         stage('Terraform Apply') {
             steps {
                 dir("terraform/envs/${env.WORKSPACE_ENV}") {
-                    withEnv(["AWS_ACCESS_KEY_ID=${AWS_CREDENTIALS_USR}",
-                             "AWS_SECRET_ACCESS_KEY=${AWS_CREDENTIALS_PSW}"]) {
-                        sh """
-                            terraform apply -auto-approve \
-                                -var='cluster_name=${env.CLUSTER_NAME}' \
-                                -var='region=${env.AWS_REGION}'
-                        """
-                    }
+                    sh "terraform apply -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'"
                 }
             }
         }
@@ -123,23 +104,14 @@ pipeline {
         stage('Configure kubeconfig') {
             steps {
                 script {
-                    withEnv(["AWS_ACCESS_KEY_ID=${AWS_CREDENTIALS_USR}",
-                             "AWS_SECRET_ACCESS_KEY=${AWS_CREDENTIALS_PSW}"]) {
-                        sh """
-                            mkdir -p /var/lib/jenkins/.kube
-                            aws eks update-kubeconfig \
-                                --name ${env.CLUSTER_NAME} \
-                                --region ${env.AWS_REGION} \
-                                --kubeconfig ${env.KUBECONFIG_PATH}
-                        """
-                    }
+                    sh "aws eks update-kubeconfig --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --kubeconfig ${env.KUBECONFIG_PATH}"
                 }
             }
         }
 
         stage('Deploy Node App to EKS') {
             steps {
-                dir("k8s/${env.WORKSPACE_ENV}") {
+                dir('k8s') {
                     sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
                     sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
                 }
@@ -154,22 +126,11 @@ pipeline {
                 }
             }
         }
+
     }
 
     post {
-        success {
-            echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME}!"
-        }
-        failure {
-            echo "❌ Pipeline failed for branch ${env.BRANCH_NAME}! Triggering rollback..."
-            dir("terraform/envs/${env.WORKSPACE_ENV}") {
-                script {
-                    withEnv(["AWS_ACCESS_KEY_ID=${AWS_CREDENTIALS_USR}",
-                             "AWS_SECRET_ACCESS_KEY=${AWS_CREDENTIALS_PSW}"]) {
-                        sh "terraform destroy -auto-approve || echo '⚠️ Rollback failed; manual intervention required.'"
-                    }
-                }
-            }
-        }
+        success { echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME}!" }
+        failure { echo "❌ Pipeline failed for branch ${env.BRANCH_NAME}!" }
     }
 }
