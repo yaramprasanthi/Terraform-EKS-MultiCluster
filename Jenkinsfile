@@ -3,7 +3,9 @@ pipeline {
 
     // Parameters for dynamic configuration
     parameters {
-        string(name: 'REGION', defaultValue: 'ap-south-1', description: 'AWS region for EKS cluster')
+        string(name: 'CLUSTER_NAME', defaultValue: 'EKS', description: 'Enter EKS cluster name')
+        string(name: 'REGION', defaultValue: 'ap-south-1', description: 'Enter AWS region')
+        choice(name: 'DESTROY_CONFIRMATION', choices: ['no', 'yes'], description: 'If cluster exists, do you want to destroy it?')
     }
 
     environment {
@@ -110,23 +112,23 @@ pipeline {
         }
 
         stage('Deploy Node App to EKS') {
-            steps {
-                dir('k8s') {
-                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
-                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
-                }
-            }
-        }
+			steps {
+				dir("k8s/${env.WORKSPACE_ENV}") {
+					sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
+					sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
+				}
+			}
+		}
 
         stage('Verify Deployment') {
-            steps {
-                script {
-                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get pods -o wide"
-                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc"
-                }
-            }
-        }
-
+			steps {
+				script {
+					echo "Verifying deployment in ${env.WORKSPACE_ENV} environment..."
+					sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get pods -o wide"
+					sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc"
+				}
+			}
+		}
     }
 
     post {
