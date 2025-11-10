@@ -116,8 +116,11 @@ pipeline {
         stage('Deploy Node App to EKS') {
 			steps {
 				dir("k8s/${env.WORKSPACE_ENV}") {
-					sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
-					sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
+					sh """
+					sed -i 's|IMAGE_TAG|${env.WORKSPACE_ENV}|g' k8s/${env.WORKSPACE_ENV}/deployment.yaml
+					kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f k8s/${env.WORKSPACE_ENV}/deployment.yaml
+					kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f k8s/${env.WORKSPACE_ENV}/service.yaml
+					"""
 				}
 			}
 		}
