@@ -1,213 +1,138 @@
 pipeline {
     agent any
 
+    // Parameters for dynamic configuration
     parameters {
+        string(name: 'CLUSTER_NAME', defaultValue: 'EKS', description: 'Enter EKS cluster name')
+        string(name: 'REGION', defaultValue: 'ap-south-1', description: 'Enter AWS region')
         choice(name: 'DESTROY_CONFIRMATION', choices: ['no', 'yes'], description: 'If cluster exists, do you want to destroy it?')
     }
 
     environment {
-        AWS_REGION = ''
-        WORKSPACE_ENV = ''        // dev/staging/prod
-        CLUSTER_NAME = ''
-        KUBECONFIG_PATH = ''
+        // Global AWS credentials (Jenkins credential ID: 'aws-access-key')
+        AWS_CREDENTIALS = credentials('aws-access-key')
+        AWS_REGION = "${params.REGION}"
+
+        // DockerHub credentials (Jenkins credential ID: 'dockerhub-creds')
+        DOCKERHUB_CRED = credentials('dockerhub-creds')
     }
 
     stages {
 
+        stage('Checkout SCM') {
+            steps {
+                checkout scm
+            }
+        }
+
         stage('Set Environment Based on Branch') {
             steps {
                 script {
-                    if (env.BRANCH_NAME == 'dev') {
+                    if ("${env.BRANCH_NAME}" == "dev") {
                         env.WORKSPACE_ENV = 'dev'
                         env.CLUSTER_NAME = 'eks-dev'
-                        env.AWS_REGION = 'ap-south-1'
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-dev-config"
-                    } else if (env.BRANCH_NAME == 'staging') {
+                    } else if ("${env.BRANCH_NAME}" == "staging") {
                         env.WORKSPACE_ENV = 'staging'
                         env.CLUSTER_NAME = 'eks-staging'
-                        env.AWS_REGION = 'ap-south-1'
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-staging-config"
-                    } else if (env.BRANCH_NAME == 'main') {
+                    } else if ("${env.BRANCH_NAME}" == "main") {
                         env.WORKSPACE_ENV = 'prod'
                         env.CLUSTER_NAME = 'eks-prod'
-                        env.AWS_REGION = 'ap-south-1'
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-prod-config"
                     } else {
                         error("Unknown branch: ${env.BRANCH_NAME}")
                     }
-                    echo "🌎 Branch ${env.BRANCH_NAME} → Cluster ${env.CLUSTER_NAME}, Region ${env.AWS_REGION}"
+
+                    echo "Branch ${env.BRANCH_NAME} → Cluster ${env.CLUSTER_NAME}, Region ${env.AWS_REGION}"
                 }
             }
         }
 
         stage('Check Cluster Status') {
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access-key']]) {
-                    script {
-                        def status = sh(
-                            script: "aws eks describe-cluster --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --query 'cluster.status' --output text 2>/dev/null || echo 'NOT_FOUND'",
-                            returnStdout: true
-                        ).trim()
-                        if (status != 'NOT_FOUND') {
-                            echo "🧨 Cluster ${env.CLUSTER_NAME} exists (status: ${status})"
-                            env.CLUSTER_EXISTS = "true"
-                        } else {
-                            echo "✨ Cluster ${env.CLUSTER_NAME} not found — will create a new one."
-                            env.CLUSTER_EXISTS = "false"
-                        }
-                    }
-                }
-            }
-        }
-
-        stage('User Confirmation to Destroy') {
-            when { expression { env.CLUSTER_EXISTS == 'true' } }
-            steps {
                 script {
-                    if (params.DESTROY_CONFIRMATION == 'yes') {
-                        echo "⚠️ User confirmed destroy for cluster ${env.CLUSTER_NAME}"
-                        env.ACTION = "destroy"
+                    def status = sh(
+                        script: "aws eks describe-cluster --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --query cluster.status --output text || echo NOT_FOUND",
+                        returnStdout: true
+                    ).trim()
+                    if (status == 'NOT_FOUND') {
+                        echo "Cluster ${env.CLUSTER_NAME} not found — will create a new one."
                     } else {
-                        echo "🚫 Destroy not confirmed — skipping destroy. Exiting pipeline."
-                        currentBuild.result = 'ABORTED'
-                        error("Pipeline stopped: Destroy not confirmed for ${env.CLUSTER_NAME}")
+                        echo "Cluster ${env.CLUSTER_NAME} exists with status: ${status}"
                     }
                 }
             }
         }
 
         stage('Build Node App') {
-            when { expression { env.CLUSTER_EXISTS == 'false' } }
             steps {
-                echo "📦 Building Node.js Application..."
                 dir('app') {
-                    sh '''
-                        npm install
-                        docker build -t yaramprasanthi/nodeapp:${CLUSTER_NAME} .
-                    '''
-                }
-            }
-        }
-
-        stage('Push Docker Image') {
-            when { expression { env.CLUSTER_EXISTS == 'false' } }
-            steps {
-                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-                    sh '''
-                        echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
-                        docker push yaramprasanthi/nodeapp:${CLUSTER_NAME}
-                    '''
-                }
-            }
-        }
-
-        stage('Terraform Init & Apply/Destroy') {
-            steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access-key']]) {
-                    dir("terraform/envs/${env.WORKSPACE_ENV}") {
-                        echo "🧱 Running Terraform in folder: terraform/envs/${env.WORKSPACE_ENV}"
-                        sh '''
-                            rm -rf .terraform
-                            terraform init -reconfigure
-                        '''
-                        sh "terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}"
-                        script {
-                            if (env.ACTION == "destroy") {
-                                echo "🔥 Destroying EKS cluster: ${env.CLUSTER_NAME}"
-                                sh "terraform destroy -auto-approve -var=cluster_name=${env.CLUSTER_NAME} -var=region=${env.AWS_REGION}"
-                            } else if (env.CLUSTER_EXISTS == "false") {
-                                echo "🚀 Applying Terraform for EKS cluster: ${env.CLUSTER_NAME}"
-                                sh "terraform apply -auto-approve -var=cluster_name=${env.CLUSTER_NAME} -var=region=${env.AWS_REGION}"
-                            } else {
-                                echo "✅ No Terraform action required."
-                            }
-                        }
+                    sh 'npm install'
+                    script {
+                        docker.build("yaramprasanthi/nodeapp:${env.CLUSTER_NAME}")
                     }
                 }
             }
         }
 
-        stage('Configure kubeconfig') {
-            when { expression { env.CLUSTER_EXISTS == 'false' } }
+        stage('Push Docker Image') {
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access-key']]) {
-                    sh '''
-                        mkdir -p $(dirname ${KUBECONFIG_PATH})
-                        aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME} --kubeconfig ${KUBECONFIG_PATH}
-                        kubectl get nodes --kubeconfig ${KUBECONFIG_PATH}
-                    '''
+                script {
+                    docker.withRegistry('', 'dockerhub-creds') {
+                        docker.image("yaramprasanthi/nodeapp:${env.CLUSTER_NAME}").push()
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Init & Workspace') {
+            steps {
+                dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                    sh 'terraform init -reconfigure'
+                    sh "terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}"
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            steps {
+                dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                    sh "terraform apply -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'"
+                }
+            }
+        }
+
+        stage('Configure kubeconfig') {
+            steps {
+                script {
+                    sh "aws eks update-kubeconfig --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --kubeconfig ${env.KUBECONFIG_PATH}"
                 }
             }
         }
 
         stage('Deploy Node App to EKS') {
-            when { expression { env.CLUSTER_EXISTS == 'false' } }
             steps {
                 dir('k8s') {
-                    sh '''
-                        kubectl apply -f deployment.yaml --kubeconfig ${KUBECONFIG_PATH}
-                        kubectl apply -f service.yaml --kubeconfig ${KUBECONFIG_PATH}
-                        DEPLOY_NAME=$(kubectl get deploy -o jsonpath="{.items[0].metadata.name}" --kubeconfig ${KUBECONFIG_PATH})
-                        kubectl rollout status deployment/$DEPLOY_NAME --timeout=180s --kubeconfig ${KUBECONFIG_PATH}
-                    '''
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
                 }
             }
         }
 
         stage('Verify Deployment') {
-            when { expression { env.CLUSTER_EXISTS == 'false' } }
             steps {
-                sh '''
-                    kubectl get pods -o wide --kubeconfig ${KUBECONFIG_PATH}
-                    kubectl get svc --kubeconfig ${KUBECONFIG_PATH}
-                '''
-            }
-        }
-
-        stage('Force Cleanup') {
-            when { expression { env.ACTION == 'destroy' } }
-            steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access-key']]) {
-                    sh '''
-                        set +e
-                        echo "🔎 Checking for leftover VPC resources..."
-                        VPC_ID=$(aws ec2 describe-vpcs --region ${AWS_REGION} --filters "Name=tag:Name,Values=${CLUSTER_NAME}-vpc" --query "Vpcs[0].VpcId" --output text 2>/dev/null)
-                        if [ "$VPC_ID" != "None" ] && [ "$VPC_ID" != "" ]; then
-                            echo "Found leftover VPC: $VPC_ID — cleaning up..."
-                            for IGW in $(aws ec2 describe-internet-gateways --region ${AWS_REGION} --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[].InternetGatewayId" --output text); do
-                                aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC_ID --region ${AWS_REGION}
-                                aws ec2 delete-internet-gateway --internet-gateway-id $IGW --region ${AWS_REGION}
-                            done
-                            for SUBNET in $(aws ec2 describe-subnets --region ${AWS_REGION} --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[].SubnetId" --output text); do
-                                aws ec2 delete-subnet --subnet-id $SUBNET --region ${AWS_REGION}
-                            done
-                            aws ec2 delete-vpc --vpc-id $VPC_ID --region ${AWS_REGION}
-                        else
-                            echo "✅ No leftover VPC found for ${CLUSTER_NAME}"
-                        fi
-                    '''
+                script {
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get pods -o wide"
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc"
                 }
             }
         }
+
     }
 
     post {
-        success {
-            script {
-                if (env.ACTION == 'destroy') {
-                    echo "✅ Successfully destroyed EKS cluster ${env.CLUSTER_NAME}!"
-                } else if (env.CLUSTER_EXISTS == 'false') {
-                    echo "✅ EKS Cluster ${env.CLUSTER_NAME} created and app deployed!"
-                } else {
-                    echo "✅ No action performed."
-                }
-            }
-        }
-        failure {
-            echo "❌ Pipeline failed for ${env.CLUSTER_NAME}!"
-        }
-        aborted {
-            echo "⚠️ Pipeline aborted by user."
-        }
+        success { echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME}!" }
+        failure { echo "❌ Pipeline failed for branch ${env.BRANCH_NAME}!" }
     }
 }
