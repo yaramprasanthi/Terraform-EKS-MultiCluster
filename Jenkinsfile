@@ -9,7 +9,10 @@ pipeline {
     }
 
     environment {
+        // Jenkins credentials
+        AWS_CREDENTIALS = credentials('aws-access-key')
         AWS_REGION = "${params.REGION}"
+        DOCKERHUB_CRED = credentials('dockerhub-creds')
     }
 
     stages {
@@ -27,28 +30,21 @@ pipeline {
                         env.WORKSPACE_ENV = 'dev'
                         env.DEFAULT_CLUSTER_NAME = 'eks-dev'
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-dev-config"
-
                     } else if ("${env.BRANCH_NAME}" == "staging") {
                         env.WORKSPACE_ENV = 'staging'
                         env.DEFAULT_CLUSTER_NAME = 'eks-staging'
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-staging-config"
-
                     } else if ("${env.BRANCH_NAME}" == "main") {
                         env.WORKSPACE_ENV = 'prod'
                         env.DEFAULT_CLUSTER_NAME = 'eks-prod'
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-prod-config"
-
                     } else {
                         error("Unknown branch: ${env.BRANCH_NAME}")
                     }
 
                     // Use parameterized cluster name if provided
                     env.CLUSTER_NAME = params.CLUSTER_NAME?.trim() ?: env.DEFAULT_CLUSTER_NAME
-
-                    echo "Branch: ${env.BRANCH_NAME}"
-                    echo "Environment: ${env.WORKSPACE_ENV}"
-                    echo "Cluster Name: ${env.CLUSTER_NAME}"
-                    echo "AWS Region: ${env.AWS_REGION}"
+                    echo "Branch ${env.BRANCH_NAME} → Cluster ${env.CLUSTER_NAME}, Region ${env.AWS_REGION}"
                 }
             }
         }
@@ -56,45 +52,29 @@ pipeline {
         stage('Check & Destroy Cluster (Optional)') {
             steps {
                 script {
+                    def status = sh(
+                        script: "aws eks describe-cluster --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --query cluster.status --output text || echo NOT_FOUND",
+                        returnStdout: true
+                    ).trim()
 
-                    // ✅ Correct AWS credentials binding
-                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                        credentialsId: 'aws-access-key']]) {
-
-                        // ✅ Correct cluster existence check using exit code
-                        def clusterExists = sh(
-                            script: """
-                                set +e
-                                aws eks describe-cluster --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} >/dev/null 2>&1
-                                echo \$?
-                            """,
-                            returnStdout: true
-                        ).trim()
-
-                        // ✅ Destroy mode
-                        if (params.DESTROY_CONFIRMATION == 'yes') {
-
-                            if (clusterExists == "0") {
-                                echo "Cluster exists → Destroying cluster ${env.CLUSTER_NAME}"
-
-                                dir("terraform/envs/${env.WORKSPACE_ENV}") {
-                                    sh """
-                                    terraform init -reconfigure
-                                    terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
-                                    terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
-                                    """
-                                }
-
-                            } else {
-                                echo "Cluster does not exist. Nothing to destroy."
-                            }
-
-                            echo "Stopping pipeline because DESTROY_CONFIRMATION = yes"
-                            currentBuild.result = 'SUCCESS'
-                            error("STOP_PIPELINE_AFTER_DESTROY")
+                    if (status != 'NOT_FOUND' && params.DESTROY_CONFIRMATION == 'yes') {
+                        echo "Destroying existing cluster ${env.CLUSTER_NAME} as requested..."
+                        dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                            sh """
+                            terraform init -reconfigure
+                            terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
+                            terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
+                            """
                         }
-
-                        echo "Destroy not selected → proceeding with deployment"
+                        if (params.DESTROY_CONFIRMATION == 'yes') {
+                            echo "Cluster destroyed. Exiting pipeline as per user request."
+                            currentBuild.result = 'SUCCESS'
+                            return
+                        }
+                    } else if (status != 'NOT_FOUND') {
+                        echo "Cluster ${env.CLUSTER_NAME} exists, proceeding with deployment..."
+                    } else {
+                        echo "Cluster ${env.CLUSTER_NAME} not found. Ready for creation."
                     }
                 }
             }
@@ -160,6 +140,15 @@ pipeline {
 
     post {
         success { echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME}!" }
-        failure { echo "❌ Pipeline failed." }
+        failure {
+            echo "❌ Pipeline failed. Cleaning up any partially created resources..."
+            dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                sh """
+                terraform init -reconfigure
+                terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
+                terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}' || echo 'Nothing to destroy'
+                """
+            }
+        }
     }
 }
