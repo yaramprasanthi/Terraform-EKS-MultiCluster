@@ -66,7 +66,7 @@ pipeline {
                             terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
                             """
                         }
-                        if (params.DESTROY_CLUSTER) {
+                        if (params.DESTROY_CLUSTER == 'yes') {
                             echo "Cluster destroyed. Exiting pipeline as per user request."
                             currentBuild.result = 'SUCCESS'
                             return
