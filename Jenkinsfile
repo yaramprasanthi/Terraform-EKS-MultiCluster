@@ -41,25 +41,28 @@ pipeline {
         stage('Set Environment Based on Branch') {
             steps {
                 script {
+
+                    // ✅ Set environment workspace (ALLOWED BY TERRAFORM)
                     if (env.BRANCH_NAME == "dev") {
-                        env.WORKSPACE_ENV = 'dev'
-                        env.DEFAULT_CLUSTER_NAME = 'eks-dev'
+                        env.WORKSPACE_ENV = "dev"
+                        env.DEFAULT_CLUSTER_NAME = "eks-dev"
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-dev-config"
 
                     } else if (env.BRANCH_NAME == "staging") {
-                        env.WORKSPACE_ENV = 'staging'
-                        env.DEFAULT_CLUSTER_NAME = 'eks-staging'
+                        env.WORKSPACE_ENV = "staging"
+                        env.DEFAULT_CLUSTER_NAME = "eks-staging"
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-staging-config"
 
                     } else if (env.BRANCH_NAME == "main") {
-                        env.WORKSPACE_ENV = 'prod'
-                        env.DEFAULT_CLUSTER_NAME = 'eks-prod'
+                        env.WORKSPACE_ENV = "prod"
+                        env.DEFAULT_CLUSTER_NAME = "eks-prod"
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-prod-config"
 
                     } else {
                         error("Unknown branch: ${env.BRANCH_NAME}")
                     }
 
+                    // ✅ Cluster name used in Terraform variables (hyphens allowed here)
                     env.CLUSTER_NAME = params.CLUSTER_NAME?.trim() ?: env.DEFAULT_CLUSTER_NAME
 
                     sendSlack("🔧 Environment set: `${env.WORKSPACE_ENV}` → Cluster `${env.CLUSTER_NAME}`", "#439FE0")
@@ -92,17 +95,31 @@ pipeline {
         stage('Terraform Init & Apply (Create Cluster)') {
             steps {
                 dir("terraform/envs/${env.WORKSPACE_ENV}") {
+
+                    // ✅ Correct workspace usage (no hyphens)
                     sh 'terraform init -reconfigure'
-                    sh "terraform workspace select ${env.CLUSTER_NAME} || terraform workspace new ${env.CLUSTER_NAME}"
-                    sh "terraform apply -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'"
+                    sh "terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}"
+
+                    // ✅ Create cluster
+                    sh """
+                        terraform apply -auto-approve \
+                          -var='cluster_name=${env.CLUSTER_NAME}' \
+                          -var='region=${env.AWS_REGION}'
+                    """
                 }
+
                 sendSlack("✅ Cluster `${env.CLUSTER_NAME}` created successfully!", "#28a745")
             }
         }
 
         stage('Configure kubeconfig') {
             steps {
-                sh "aws eks update-kubeconfig --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --kubeconfig ${env.KUBECONFIG_PATH}"
+                sh """
+                    aws eks update-kubeconfig \
+                        --name ${env.CLUSTER_NAME} \
+                        --region ${env.AWS_REGION} \
+                        --kubeconfig ${env.KUBECONFIG_PATH}
+                """
             }
         }
 
@@ -126,19 +143,24 @@ pipeline {
     }
 
     post {
+
+        // ✅ SUCCESS 
         success {
             sendSlack("🎉 *Pipeline Success* for `${env.BRANCH_NAME}`", "#2eb886")
         }
 
+        // ✅ FAILURE — clean only partially created cluster
         failure {
             sendSlack("❌ *Pipeline FAILED* for `${env.BRANCH_NAME}` — starting cleanup…", "#ff0000")
 
-            // ✅ Cleanup partial cluster ONLY on failure
             dir("terraform/envs/${env.WORKSPACE_ENV}") {
                 sh """
                     terraform init -reconfigure
                     terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
-                    terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
+
+                    terraform destroy -auto-approve \
+                      -var='cluster_name=${env.CLUSTER_NAME}' \
+                      -var='region=${env.AWS_REGION}'
                 """
             }
 
