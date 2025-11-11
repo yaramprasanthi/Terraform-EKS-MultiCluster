@@ -59,14 +59,20 @@ pipeline {
 
                     if (status != 'NOT_FOUND' && params.DESTROY_CONFIRMATION == 'yes') {
                         echo "Destroying existing cluster ${env.CLUSTER_NAME} as requested..."
-                        // Step 1: Delete all LoadBalancer services in all namespaces
+                        // Step 1: Configure kubeconfig before destroying cluster
+                        sh "aws eks update-kubeconfig --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} || echo 'Cluster endpoint not reachable, continuing with Terraform destroy...'"
+        
+                        // Step 2: Delete Kubernetes LoadBalancer services and ingresses
                         sh """
-                        echo "Deleting Kubernetes LoadBalancer services..."
+                        echo "Deleting Kubernetes LoadBalancer services and ingresses..."
                         kubectl get svc --all-namespaces -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}:{.metadata.name} {end}' \
-                        | xargs -n1 -r -I{} sh -c 'ns=\$(echo {} | cut -d: -f1); name=\$(echo {} | cut -d: -f2); kubectl delete svc \$name -n \$ns --ignore-not-found'
+                            | xargs -n1 -r -I{} sh -c 'ns=\$(echo {} | cut -d: -f1); name=\$(echo {} | cut -d: -f2); kubectl delete svc \$name -n \$ns --ignore-not-found'
+                        
+                        kubectl get ingress --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}:{.metadata.name} {end}' \
+                            | xargs -n1 -r -I{} sh -c 'ns=\$(echo {} | cut -d: -f1); name=\$(echo {} | cut -d: -f2); kubectl delete ingress \$name -n \$ns --ignore-not-found'
                         """
         
-                        // Step 2: Destroy Terraform-managed resources
+                        // Step 3: Destroy Terraform-managed resources in the correct workspace
                         dir("terraform/envs/${env.WORKSPACE_ENV}") {
                             sh """
                             terraform init -reconfigure
@@ -75,11 +81,18 @@ pipeline {
                             """
                         }
         
-                        // Step 3: Optionally clean up dangling ENIs (attached to deleted cluster)
+                        // Step 4: Clean up dangling ENIs
                         sh """
                         echo "Cleaning up dangling ENIs..."
                         aws ec2 describe-network-interfaces --filters "Name=description,Values=*eks*" \
-                        --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text | xargs -n1 -r aws ec2 delete-network-interface
+                            --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text | xargs -n1 -r aws ec2 delete-network-interface || echo "No dangling ENIs found."
+                        """
+        
+                        // Step 5: Optionally clean up other orphaned resources (like Load Balancers, security groups)
+                        sh """
+                        echo "Cleaning up orphaned Load Balancers..."
+                        aws elbv2 describe-load-balancers --query 'LoadBalancers[?starts_with(DNSName, \`${env.CLUSTER_NAME}\`)].LoadBalancerArn' --output text \
+                            | xargs -n1 -r aws elbv2 delete-load-balancer
                         """
         
                         echo "Cluster and dependent resources destroyed successfully. Exiting pipeline as per user request."
