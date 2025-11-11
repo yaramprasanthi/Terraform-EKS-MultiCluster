@@ -1,12 +1,13 @@
-def stopPipeline = false   // <-- KEY FIX
+// ✅ KEY FIX — declare control variable
+def stopPipeline = false
 
 pipeline {
     agent any
 
     parameters {
-        string(name: 'CLUSTER_NAME', defaultValue: '', description: 'Enter EKS cluster name')
+        string(name: 'CLUSTER_NAME', defaultValue: '', description: 'Enter EKS cluster name (leave empty to use branch default)')
         string(name: 'REGION', defaultValue: 'ap-south-1', description: 'Enter AWS region')
-        choice(name: 'DESTROY_CONFIRMATION', choices: ['no', 'yes'], description: 'Destroy cluster?')
+        choice(name: 'DESTROY_CONFIRMATION', choices: ['no', 'yes'], description: 'Destroy cluster if exists before deployment?')
     }
 
     environment {
@@ -36,14 +37,14 @@ pipeline {
                         env.WORKSPACE_ENV = 'prod'
                         env.DEFAULT_CLUSTER_NAME = 'eks-prod'
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-prod-config"
+                    } else {
+                        error("Unknown branch: ${env.BRANCH_NAME}")
                     }
 
+                    // Use parameterized cluster name OR default one
                     env.CLUSTER_NAME = params.CLUSTER_NAME?.trim() ?: env.DEFAULT_CLUSTER_NAME
 
-                    echo "Branch: ${env.BRANCH_NAME}"
-                    echo "Environment: ${env.WORKSPACE_ENV}"
-                    echo "Cluster Name: ${env.CLUSTER_NAME}"
-                    echo "AWS Region: ${env.AWS_REGION}"
+                    echo "Branch ${env.BRANCH_NAME} → Cluster ${env.CLUSTER_NAME}, Region ${env.AWS_REGION}"
                 }
             }
         }
@@ -59,7 +60,7 @@ pipeline {
                     if (params.DESTROY_CONFIRMATION == 'yes') {
 
                         if (status != 'NOT_FOUND') {
-                            echo "Cluster exists → Destroying ${env.CLUSTER_NAME}"
+                            echo "Destroying existing cluster ${env.CLUSTER_NAME}..."
 
                             dir("terraform/envs/${env.WORKSPACE_ENV}") {
                                 sh """
@@ -73,22 +74,22 @@ pipeline {
                         }
 
                         echo "Cluster destroyed. Stopping pipeline."
-                        stopPipeline = true            // <-- KEY FIX
+                        stopPipeline = true     // ✅ KEY FIX
                     } else {
-                        echo "Destroy not selected → Continue deployment."
+                        echo "Destroy not selected → Continuing deployment."
                     }
                 }
             }
         }
+
+        // ✅ EVERY BELOW STAGE WILL NOW BE SKIPPED IF stopPipeline == true
 
         stage('Build Node App') {
             when { expression { stopPipeline == false } }
             steps {
                 dir('app') {
                     sh 'npm install'
-                    script {
-                        docker.build("yaramprasanthi/nodeapp:${env.WORKSPACE_ENV}")
-                    }
+                    script { docker.build("yaramprasanthi/nodeapp:${env.WORKSPACE_ENV}") }
                 }
             }
         }
@@ -142,7 +143,16 @@ pipeline {
     }
 
     post {
-        success { echo "✅ Pipeline completed successfully!" }
-        failure { echo "❌ Pipeline failed!" }
+        success { echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME}!" }
+        failure {
+            echo "❌ Pipeline failed. Cleaning up resources..."
+            dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                sh """
+                    terraform init -reconfigure
+                    terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
+                    terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}' || echo 'Nothing to destroy'
+                """
+            }
+        }
     }
 }
