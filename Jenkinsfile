@@ -12,14 +12,16 @@ pipeline {
         AWS_REGION = "${params.REGION}"
         DOCKERHUB_CRED = credentials('dockerhub-creds')
 
-        // Flag to stop the pipeline after destroy
+        // flag for stopping pipeline after destroy
         STOP_AFTER_DESTROY = 'false'
     }
 
     stages {
 
         stage('Checkout SCM') {
-            steps { checkout scm }
+            steps {
+                checkout scm
+            }
         }
 
         stage('Set Environment Based on Branch') {
@@ -61,17 +63,20 @@ pipeline {
                     ).trim()
 
                     if (status != 'NOT_FOUND' && params.DESTROY_CONFIRMATION == 'yes') {
-                        echo "Destroying existing cluster ${env.CLUSTER_NAME} as requested..."
+
+                        echo "Destroying existing cluster ${env.CLUSTER_NAME} ..."
 
                         dir("terraform/envs/${env.WORKSPACE_ENV}") {
                             sh """
                                 terraform init -reconfigure
                                 terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
-                                terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
+                                terraform destroy -auto-approve \
+                                  -var='cluster_name=${env.CLUSTER_NAME}' \
+                                  -var='region=${env.AWS_REGION}'
                             """
                         }
 
-                        echo "Cluster destroyed successfully. Stopping pipeline as per user request."
+                        echo "Cluster destroyed. Stopping pipeline."
                         env.STOP_AFTER_DESTROY = 'true'
                     }
                 }
@@ -108,7 +113,9 @@ pipeline {
                     sh """
                         terraform init -reconfigure
                         terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
-                        terraform apply -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
+                        terraform apply -auto-approve \
+                          -var='cluster_name=${env.CLUSTER_NAME}' \
+                          -var='region=${env.AWS_REGION}'
                     """
                 }
             }
@@ -138,20 +145,22 @@ pipeline {
                 sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc"
             }
         }
-    }
+
+    }  // END stages
 
     post {
         success {
             script {
                 if (env.STOP_AFTER_DESTROY == 'true') {
-                    echo "✅ Destroy-only execution finished successfully."
+                    echo "✅ Cluster destroyed successfully."
                 } else {
-                    echo "✅ Deployment pipeline finished successfully."
+                    echo "✅ Deployment completed successfully."
                 }
             }
         }
+
         failure {
-            echo "❌ Pipeline failed. Cleaning up resources..."
+            echo "❌ Pipeline failed!"
         }
     }
 }
