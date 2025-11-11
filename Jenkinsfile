@@ -62,7 +62,7 @@ pipeline {
                         dir("terraform/envs/${env.WORKSPACE_ENV}") {
                             sh """
                             terraform init -reconfigure
-                            terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
+                            terraform workspace select ${env.CLUSTER_NAME} || terraform workspace new ${env.CLUSTER_NAME}
                             terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
                             """
                         }
@@ -105,7 +105,7 @@ pipeline {
             steps {
                 dir("terraform/envs/${env.WORKSPACE_ENV}") {
                     sh 'terraform init -reconfigure'
-                    sh "terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}"
+                    sh "terraform workspace select ${env.CLUSTER_NAME} || terraform workspace new ${env.CLUSTER_NAME}"
                     sh "terraform apply -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'"
                 }
             }
@@ -145,7 +145,7 @@ pipeline {
             dir("terraform/envs/${env.WORKSPACE_ENV}") {
                 sh """
                 terraform init -reconfigure
-                terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
+                terraform workspace select ${env.CLUSTER_NAME} || terraform workspace new ${env.CLUSTER_NAME}
                 terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}' || echo 'Nothing to destroy'
                 """
             }
