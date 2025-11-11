@@ -67,7 +67,7 @@ pipeline {
                             """
                         }
                         currentBuild.result = 'SUCCESS'
-                        error("Cluster destroyed. Exiting pipeline as per user request.")
+                        info("Cluster destroyed. Exiting pipeline as per user request.")
                     } else if (status != 'NOT_FOUND') {
                         echo "Cluster ${env.CLUSTER_NAME} exists, proceeding with deployment..."
                     } else {
