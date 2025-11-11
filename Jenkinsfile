@@ -1,3 +1,14 @@
+// ✅ Slack Notification Function
+def sendSlack(msg, color = "#36a64f") {
+    withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_URL')]) {
+        sh """
+            curl -X POST -H 'Content-type: application/json' \
+            --data '{ "attachments": [ { "color": "${color}", "text": "${msg}" } ] }' \
+            $SLACK_URL
+        """
+    }
+}
+
 // ✅ KEY FIX — declare control variable
 def stopPipeline = false
 
@@ -41,10 +52,11 @@ pipeline {
                         error("Unknown branch: ${env.BRANCH_NAME}")
                     }
 
-                    // Use parameterized cluster name OR default one
                     env.CLUSTER_NAME = params.CLUSTER_NAME?.trim() ?: env.DEFAULT_CLUSTER_NAME
 
                     echo "Branch ${env.BRANCH_NAME} → Cluster ${env.CLUSTER_NAME}, Region ${env.AWS_REGION}"
+
+                    sendSlack("🚀 Pipeline started for *${env.BRANCH_NAME}* → Cluster `${env.CLUSTER_NAME}`", "#439FE0")
                 }
             }
         }
@@ -62,6 +74,8 @@ pipeline {
                         if (status != 'NOT_FOUND') {
                             echo "Destroying existing cluster ${env.CLUSTER_NAME}..."
 
+                            sendSlack("🛑 Destroying cluster `${env.CLUSTER_NAME}` as requested…", "#ff0000")
+
                             dir("terraform/envs/${env.WORKSPACE_ENV}") {
                                 sh """
                                     terraform init -reconfigure
@@ -71,10 +85,13 @@ pipeline {
                             }
                         } else {
                             echo "Cluster not found → Nothing to destroy."
+                            sendSlack("⚠️ Cluster `${env.CLUSTER_NAME}` not found. Nothing to destroy.", "#ffaa00")
                         }
 
                         echo "Cluster destroyed. Stopping pipeline."
-                        stopPipeline = true     // ✅ KEY FIX
+                        sendSlack("✅ Cluster `${env.CLUSTER_NAME}` destroyed successfully. Pipeline stopping.", "#28a745")
+
+                        stopPipeline = true
                     } else {
                         echo "Destroy not selected → Continuing deployment."
                     }
@@ -82,7 +99,7 @@ pipeline {
             }
         }
 
-        // ✅ EVERY BELOW STAGE WILL NOW BE SKIPPED IF stopPipeline == true
+        // ✅ All later stages run only if stopPipeline == false
 
         stage('Build Node App') {
             when { expression { stopPipeline == false } }
@@ -91,6 +108,7 @@ pipeline {
                     sh 'npm install'
                     script { docker.build("yaramprasanthi/nodeapp:${env.WORKSPACE_ENV}") }
                 }
+                sendSlack("📦 Node app build completed for `${env.WORKSPACE_ENV}`", "#439FE0")
             }
         }
 
@@ -102,6 +120,7 @@ pipeline {
                         docker.image("yaramprasanthi/nodeapp:${env.WORKSPACE_ENV}").push()
                     }
                 }
+                sendSlack("📤 Docker image pushed for `${env.WORKSPACE_ENV}`", "#439FE0")
             }
         }
 
@@ -113,6 +132,7 @@ pipeline {
                     sh "terraform workspace select ${env.CLUSTER_NAME} || terraform workspace new ${env.CLUSTER_NAME}"
                     sh "terraform apply -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'"
                 }
+                sendSlack("✅ Terraform Apply completed. Cluster `${env.CLUSTER_NAME}` created.", "#28a745")
             }
         }
 
@@ -130,6 +150,7 @@ pipeline {
                     sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
                     sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
                 }
+                sendSlack("🚀 Application deployed to `${env.CLUSTER_NAME}`", "#36a64f")
             }
         }
 
@@ -138,21 +159,19 @@ pipeline {
             steps {
                 sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get pods -o wide"
                 sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc"
+                sendSlack("✅ Deployment verification completed for `${env.CLUSTER_NAME}`", "#28a745")
             }
         }
     }
 
     post {
-        success { echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME}!" }
+        success {
+            echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME}!"
+            sendSlack("🎉 *Pipeline Success:* Branch `${env.BRANCH_NAME}` completed successfully!", "#2eb886")
+        }
         failure {
-            echo "❌ Pipeline failed. Cleaning up resources..."
-            dir("terraform/envs/${env.WORKSPACE_ENV}") {
-                sh """
-                    terraform init -reconfigure
-                    terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
-                    terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}' || echo 'Nothing to destroy'
-                """
-            }
+            echo "❌ Pipeline failed."
+            sendSlack("❌ *Pipeline FAILED* for branch `${env.BRANCH_NAME}`", "#ff0000")
         }
     }
 }
