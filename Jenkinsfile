@@ -1,11 +1,15 @@
 pipeline {
     agent any
 
+    // Parameters for dynamic configuration
     parameters {
-        string(name: 'REGION', defaultValue: 'ap-south-1', description: 'AWS Region')
+        string(name: 'CLUSTER_NAME', defaultValue: '', description: 'Enter EKS cluster name (leave empty to use branch default)')
+        string(name: 'REGION', defaultValue: 'ap-south-1', description: 'Enter AWS region')
+        choice(name: 'DESTROY_CONFIRMATION', choices: ['no', 'yes'], description: 'Destroy cluster if exists before deployment?')
     }
 
     environment {
+        // Jenkins credentials
         AWS_CREDENTIALS = credentials('aws-access-key')
         AWS_REGION = "${params.REGION}"
         DOCKERHUB_CRED = credentials('dockerhub-creds')
@@ -24,43 +28,71 @@ pipeline {
                 script {
                     if ("${env.BRANCH_NAME}" == "dev") {
                         env.WORKSPACE_ENV = 'dev'
-                        env.CLUSTER_NAME = 'eks-dev'
+                        env.DEFAULT_CLUSTER_NAME = 'eks-dev'
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-dev-config"
                     } else if ("${env.BRANCH_NAME}" == "staging") {
                         env.WORKSPACE_ENV = 'staging'
-                        env.CLUSTER_NAME = 'eks-staging'
+                        env.DEFAULT_CLUSTER_NAME = 'eks-staging'
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-staging-config"
                     } else if ("${env.BRANCH_NAME}" == "main") {
-                        env.WORKSPACE_ENV = 'production'
-                        env.CLUSTER_NAME = 'eks-prod'
+                        env.WORKSPACE_ENV = 'prod'
+                        env.DEFAULT_CLUSTER_NAME = 'eks-prod'
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-prod-config"
                     } else {
                         error("Unknown branch: ${env.BRANCH_NAME}")
                     }
 
-                    // Versioned image tag based on Jenkins build number
-                    env.IMAGE_TAG = "${env.WORKSPACE_ENV}-v${env.BUILD_NUMBER}"
-
-                    echo "Branch: ${env.BRANCH_NAME} → Env: ${env.WORKSPACE_ENV} → Tag: ${env.IMAGE_TAG}"
+                    // Use parameterized cluster name if provided
+                    env.CLUSTER_NAME = params.CLUSTER_NAME?.trim() ?: env.DEFAULT_CLUSTER_NAME
+                    echo "Branch ${env.BRANCH_NAME} → Cluster ${env.CLUSTER_NAME}, Region ${env.AWS_REGION}"
                 }
             }
         }
 
-        stage('Build Node.js App') {
+        stage('Check & Destroy Cluster (Optional)') {
+            steps {
+                script {
+                    def status = sh(
+                        script: "aws eks describe-cluster --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --query cluster.status --output text || echo NOT_FOUND",
+                        returnStdout: true
+                    ).trim()
+
+                    if (status != 'NOT_FOUND' && params.DESTROY_CONFIRMATION == 'yes') {
+                        echo "Destroying existing cluster ${env.CLUSTER_NAME} as requested..."
+                        dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                            sh """
+                            terraform init -reconfigure
+                            terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
+                            terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
+                            """
+                        }
+                        currentBuild.result = 'SUCCESS'
+                        error("Cluster destroyed. Exiting pipeline as per user request.")
+                    } else if (status != 'NOT_FOUND') {
+                        echo "Cluster ${env.CLUSTER_NAME} exists, proceeding with deployment..."
+                    } else {
+                        echo "Cluster ${env.CLUSTER_NAME} not found. Ready for creation."
+                    }
+                }
+            }
+        }
+
+        stage('Build Node App') {
             steps {
                 dir('app') {
                     sh 'npm install'
+                    script {
+                        docker.build("yaramprasanthi/nodeapp:${env.WORKSPACE_ENV}")
+                    }
                 }
             }
         }
 
-        stage('Build & Push Docker Image') {
+        stage('Push Docker Image') {
             steps {
                 script {
-                    docker.build("yaramprasanthi/nodeapp:${env.IMAGE_TAG}")
-
                     docker.withRegistry('', 'dockerhub-creds') {
-                        sh "docker push yaramprasanthi/nodeapp:${env.IMAGE_TAG}"
+                        docker.image("yaramprasanthi/nodeapp:${env.WORKSPACE_ENV}").push()
                     }
                 }
             }
@@ -78,19 +110,17 @@ pipeline {
 
         stage('Configure kubeconfig') {
             steps {
-                sh "aws eks update-kubeconfig --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --kubeconfig ${env.KUBECONFIG_PATH}"
+                script {
+                    sh "aws eks update-kubeconfig --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --kubeconfig ${env.KUBECONFIG_PATH}"
+                }
             }
         }
 
         stage('Deploy Node App to EKS') {
             steps {
                 dir("k8s/${env.WORKSPACE_ENV}") {
-                    sh """
-                    kubectl --kubeconfig=${env.KUBECONFIG_PATH} set image deployment/nodeapp-deployment \
-                    nodeapp=yaramprasanthi/nodeapp:${env.IMAGE_TAG} --record || \
-                    (kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml && \
-                    kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml)
-                    """
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
                 }
             }
         }
@@ -98,7 +128,6 @@ pipeline {
         stage('Verify Deployment') {
             steps {
                 script {
-                    echo "Verifying pods and services..."
                     sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get pods -o wide"
                     sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc"
                 }
@@ -107,37 +136,15 @@ pipeline {
     }
 
     post {
-        success {
-            echo "✅ Successfully deployed ${env.CLUSTER_NAME} with image tag ${env.IMAGE_TAG}"
-        }
-
+        success { echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME}!" }
         failure {
-            script {
-                echo "❌ Deployment failed! Rolling back or cleaning up..."
-
-                // Manual input for rollback decision
-                def userChoice = input(
-                    id: 'rollbackChoice', message: 'Deployment failed! What do you want to do?',
-                    parameters: [
-                        choice(
-                            choices: ['Rollback Last Stable Version', 'Destroy Infrastructure', 'Skip'],
-                            description: 'Choose rollback or full teardown',
-                            name: 'ACTION'
-                        )
-                    ]
-                )
-
-                if (userChoice == 'Rollback Last Stable Version') {
-                    echo "Rolling back application to last stable deployment..."
-                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} rollout undo deployment/nodeapp-deployment || echo 'No previous revision found — rollback skipped.'"
-                } else if (userChoice == 'Destroy Infrastructure') {
-                    echo "Destroying infrastructure via Terraform..."
-                    dir("terraform/envs/${env.WORKSPACE_ENV}") {
-                        sh "terraform destroy -auto-approve"
-                    }
-                } else {
-                    echo "Skipping rollback/destroy as per user choice."
-                }
+            echo "❌ Pipeline failed. Cleaning up any partially created resources..."
+            dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                sh """
+                terraform init -reconfigure
+                terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
+                terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}' || echo 'Nothing to destroy'
+                """
             }
         }
     }
