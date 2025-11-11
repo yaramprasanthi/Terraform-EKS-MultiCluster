@@ -1,155 +1,161 @@
+// ✅ Slack Notification Function
+def sendSlack(msg, color = "#36a64f") {
+    withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_URL')]) {
+        sh """
+            curl -X POST -H 'Content-type: application/json' \
+            --data '{ "attachments": [ { "color": "${color}", "text": "${msg}" } ] }' \
+            $SLACK_URL
+        """
+    }
+}
+
 pipeline {
     agent any
 
-    // -------------------------
-    // 🔧 Parameters
-    // -------------------------
     parameters {
-        choice(name: 'ENV', choices: ['dev', 'staging', 'production'], description: 'Select environment to deploy')
+        string(name: 'CLUSTER_NAME', defaultValue: '', description: 'Enter EKS cluster name (optional)')
+        string(name: 'REGION', defaultValue: 'ap-south-1', description: 'Enter AWS region')
     }
 
-    // -------------------------
-    // 🌍 Environment Variables
-    // -------------------------
     environment {
         AWS_CREDENTIALS = credentials('aws-access-key')
-        TF_DIR                = 'terraform/envs'
-        DOCKER_REPO           = 'yaramprasanthi/nodeapp'
-        DOCKER_IMAGE          = "${DOCKER_REPO}:${params.ENV}-${BUILD_NUMBER}"
-        STABLE_IMAGE          = "${DOCKER_REPO}:stable-${params.ENV}"
-        KUBECONFIG_PATH       = "/var/lib/jenkins/.kube/${params.ENV}-config"
+        AWS_REGION = "${params.REGION}"
+        DOCKERHUB_CRED = credentials('dockerhub-creds')
     }
 
-    // -------------------------
-    // 🚦 Stages
-    // -------------------------
     stages {
 
-        stages {
-
-            stage('Checkout SCM') {
-                steps {
-                    checkout scm
-                }
-            }
-
-        // 🐳 Build and push Docker image for selected environment
-        stage('Build & Push Docker Image') {
+        // ✅ Pipeline Start Notification
+        stage('Start Notification') {
             steps {
                 script {
-                    echo "🚀 Building Docker image for ${params.ENV}..."
-                    withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-                        sh """
-                            docker build -t ${DOCKER_IMAGE} ./app
-                            echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
-                            docker push ${DOCKER_IMAGE}
-                        """
-                    }
+                    sendSlack("🚀 *Pipeline Started* for branch `${env.BRANCH_NAME}`", "#439FE0")
                 }
             }
         }
 
-        // ⚙️ Terraform infra setup for this environment
-        stage('Terraform Init & Apply') {
+        stage('Checkout SCM') {
+            steps { checkout scm }
+        }
+
+        stage('Set Environment Based on Branch') {
             steps {
-                dir("${TF_DIR}/${params.ENV}") {
-                    script {
-                        sh """
-                            terraform init -reconfigure
-                            terraform workspace select ${params.ENV} || terraform workspace new ${params.ENV}
-                            terraform apply -auto-approve -var='cluster_name=${params.ENV}' -var='region=ap-south-1'
-                        """
+                script {
+                    if (env.BRANCH_NAME == "dev") {
+                        env.WORKSPACE_ENV = 'dev'
+                        env.DEFAULT_CLUSTER_NAME = 'eks-dev'
+                        env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-dev-config"
+
+                    } else if (env.BRANCH_NAME == "staging") {
+                        env.WORKSPACE_ENV = 'staging'
+                        env.DEFAULT_CLUSTER_NAME = 'eks-staging'
+                        env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-staging-config"
+
+                    } else if (env.BRANCH_NAME == "main") {
+                        env.WORKSPACE_ENV = 'prod'
+                        env.DEFAULT_CLUSTER_NAME = 'eks-prod'
+                        env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-prod-config"
+
+                    } else {
+                        error("Unknown branch: ${env.BRANCH_NAME}")
                     }
+
+                    env.CLUSTER_NAME = params.CLUSTER_NAME?.trim() ?: env.DEFAULT_CLUSTER_NAME
+
+                    sendSlack("🔧 Environment set: `${env.WORKSPACE_ENV}` → Cluster `${env.CLUSTER_NAME}`", "#439FE0")
                 }
             }
         }
 
-        // 📦 Deploy image to Kubernetes cluster
-        stage('Deploy to Kubernetes') {
+        stage('Build Node App') {
+            steps {
+                dir('app') {
+                    sh 'npm install'
+                    script { docker.build("yaramprasanthi/nodeapp:${env.WORKSPACE_ENV}") }
+                }
+                sendSlack("📦 Node app build completed for `${env.WORKSPACE_ENV}`", "#439FE0")
+            }
+        }
+
+        stage('Push Docker Image') {
             steps {
                 script {
-                    echo "🚀 Deploying ${DOCKER_IMAGE} to ${params.ENV} environment..."
+                    docker.withRegistry('', 'dockerhub-creds') {
+                        docker.image("yaramprasanthi/nodeapp:${env.WORKSPACE_ENV}").push()
+                    }
+                }
+                sendSlack("📤 Docker image pushed for `${env.WORKSPACE_ENV}`", "#439FE0")
+            }
+        }
+
+        // ✅ Create Cluster Only (NO destroy logic)
+        stage('Terraform Init & Apply (Create Cluster)') {
+            steps {
+                dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                    sh 'terraform init -reconfigure'
+                    sh "terraform workspace select ${env.CLUSTER_NAME} || terraform workspace new ${env.CLUSTER_NAME}"
                     sh """
-                        aws eks update-kubeconfig --name ${params.ENV} --region ap-south-1 --kubeconfig ${KUBECONFIG_PATH}
-                        kubectl --kubeconfig=${KUBECONFIG_PATH} set image deployment/nodeapp nodeapp=${DOCKER_IMAGE} --record
-                        kubectl --kubeconfig=${KUBECONFIG_PATH} rollout status deployment/nodeapp
+                        terraform apply -auto-approve \
+                        -var='cluster_name=${env.CLUSTER_NAME}' \
+                        -var='region=${env.AWS_REGION}'
                     """
                 }
+                sendSlack("✅ Cluster `${env.CLUSTER_NAME}` created successfully!", "#28a745")
             }
         }
 
-        // 🩺 Verify health of the deployment
-        stage('Verify Application Health') {
+        stage('Configure kubeconfig') {
             steps {
-                script {
-                    echo "🔍 Checking pod status..."
-                    def unhealthyPods = sh(
-                        script: "kubectl --kubeconfig=${KUBECONFIG_PATH} get pods -n default --no-headers | awk '{print \$3}' | grep -v Running || true",
-                        returnStdout: true
-                    ).trim()
-                    if (unhealthyPods) {
-                        error("❌ Some pods are not running properly: ${unhealthyPods}")
-                    }
-
-                    def svcHost = sh(
-                        script: "kubectl --kubeconfig=${KUBECONFIG_PATH} get svc nodeapp-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'",
-                        returnStdout: true
-                    ).trim()
-
-                    if (!svcHost) {
-                        error("❌ Service LoadBalancer not ready for ${params.ENV}")
-                    }
-
-                    echo "🌐 Testing app endpoint at http://${svcHost}"
-                    def httpCode = sh(script: "curl -s -o /dev/null -w '%{http_code}' http://${svcHost}", returnStdout: true).trim()
-                    if (httpCode != "200") {
-                        error("❌ Health check failed (HTTP ${httpCode})")
-                    }
-
-                    echo "✅ App is healthy (HTTP 200)"
-                }
+                sh """
+                    aws eks update-kubeconfig \
+                    --name ${env.CLUSTER_NAME} \
+                    --region ${env.AWS_REGION} \
+                    --kubeconfig ${env.KUBECONFIG_PATH}
+                """
             }
         }
 
-        // 🏷️ If all good — tag this image as stable
-        stage('Tag Stable Image') {
+        stage('Deploy Node App to EKS') {
             steps {
-                script {
-                    echo "🏷 Updating stable image tag for ${params.ENV}"
-                    withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-                        sh """
-                            echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
-                            docker pull ${DOCKER_IMAGE}
-                            docker tag ${DOCKER_IMAGE} ${STABLE_IMAGE}
-                            docker push ${STABLE_IMAGE}
-                        """
-                    }
+                dir("k8s/${env.WORKSPACE_ENV}") {
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
                 }
+                sendSlack("🚀 Application deployed to cluster `${env.CLUSTER_NAME}`", "#36a64f")
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get pods -o wide"
+                sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc"
+                sendSlack("✅ Deployment verified for cluster `${env.CLUSTER_NAME}`", "#28a745")
             }
         }
     }
 
-    // -------------------------
-    // 🧩 Post Actions (Success / Failure)
-    // -------------------------
     post {
-
         success {
-            echo "🎉 SUCCESS: Deployed ${params.ENV} and updated ${STABLE_IMAGE} as stable."
+            sendSlack("🎉 *Pipeline Success* for `${env.BRANCH_NAME}`", "#2eb886")
         }
 
         failure {
-            echo "⚠️ FAILURE: Rolling back to last stable version for ${params.ENV}..."
-            script {
-                def stableImage = "${STABLE_IMAGE}"
+            sendSlack("❌ *Pipeline FAILED* for `${env.BRANCH_NAME}` — starting cleanup…", "#ff0000")
+
+            // ✅ Cleanup partial cluster ONLY on failure
+            dir("terraform/envs/${env.WORKSPACE_ENV}") {
                 sh """
-                    aws eks update-kubeconfig --name ${params.ENV} --region ap-south-1 --kubeconfig ${KUBECONFIG_PATH}
-                    echo "Attempting rollback to ${stableImage}..."
-                    kubectl --kubeconfig=${KUBECONFIG_PATH} set image deployment/nodeapp nodeapp=${stableImage} --record || echo "No deployment found"
-                    kubectl --kubeconfig=${KUBECONFIG_PATH} rollout status deployment/nodeapp || echo "Rollback failed or not applicable"
+                    terraform init -reconfigure
+                    terraform workspace select ${env.CLUSTER_NAME} || terraform workspace new ${env.CLUSTER_NAME}
+                    
+                    terraform destroy -auto-approve \
+                      -var='cluster_name=${env.CLUSTER_NAME}' \
+                      -var='region=${env.AWS_REGION}' \
+                      || echo 'No resources to destroy'
                 """
             }
-            echo "✅ Rollback complete — ${params.ENV} reverted to last stable image."
+
+            sendSlack("🧹 Cleanup completed. Partial cluster `${env.CLUSTER_NAME}` removed.", "#ff9900")
         }
     }
 }
