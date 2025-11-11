@@ -1,19 +1,15 @@
 pipeline {
     agent any
 
-    // Parameters for dynamic configuration
     parameters {
         string(name: 'CLUSTER_NAME', defaultValue: 'EKS', description: 'Enter EKS cluster name')
         string(name: 'REGION', defaultValue: 'ap-south-1', description: 'Enter AWS region')
-        choice(name: 'DESTROY_CONFIRMATION', choices: ['no', 'yes'], description: 'If cluster exists, do you want to destroy it?')
+        choice(name: 'DESTROY_CONFIRMATION', choices: ['no', 'yes'], description: 'If cluster exists, do you want to destroy it before running pipeline?')
     }
 
     environment {
-        // Global AWS credentials (Jenkins credential ID: 'aws-access-key')
         AWS_CREDENTIALS = credentials('aws-access-key')
         AWS_REGION = "${params.REGION}"
-
-        // DockerHub credentials (Jenkins credential ID: 'dockerhub-creds')
         DOCKERHUB_CRED = credentials('dockerhub-creds')
     }
 
@@ -56,10 +52,24 @@ pipeline {
                         script: "aws eks describe-cluster --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --query cluster.status --output text || echo NOT_FOUND",
                         returnStdout: true
                     ).trim()
+
                     if (status == 'NOT_FOUND') {
-                        echo "Cluster ${env.CLUSTER_NAME} not found — will create a new one."
+                        echo "✅ Cluster ${env.CLUSTER_NAME} not found — will create a new one."
                     } else {
-                        echo "Cluster ${env.CLUSTER_NAME} exists with status: ${status}"
+                        echo "⚠️ Cluster ${env.CLUSTER_NAME} exists with status: ${status}"
+
+                        // Handle manual destroy option
+                        if (params.DESTROY_CONFIRMATION == 'yes') {
+                            echo "User opted to destroy existing cluster before redeploy..."
+                            dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                                sh """
+                                terraform init -reconfigure
+                                terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
+                                """
+                            }
+                        } else {
+                            echo "Keeping existing cluster as per user choice (DESTROY_CONFIRMATION=no)"
+                        }
                     }
                 }
             }
@@ -70,8 +80,8 @@ pipeline {
                 dir('app') {
                     sh 'npm install'
                     script {
-                        def tag = env.WORKSPACE_ENV   // tag = dev, staging, prod
-                		docker.build("yaramprasanthi/nodeapp:${tag}")
+                        def tag = env.WORKSPACE_ENV
+                        docker.build("yaramprasanthi/nodeapp:${tag}")
                     }
                 }
             }
@@ -81,26 +91,21 @@ pipeline {
             steps {
                 script {
                     def tag = env.WORKSPACE_ENV
-            		docker.withRegistry('', 'dockerhub-creds') {
-                		docker.image("yaramprasanthi/nodeapp:${tag}").push()
+                    docker.withRegistry('', 'dockerhub-creds') {
+                        docker.image("yaramprasanthi/nodeapp:${tag}").push()
                     }
                 }
             }
         }
 
-        stage('Terraform Init & Workspace') {
+        stage('Terraform Init & Apply') {
             steps {
                 dir("terraform/envs/${env.WORKSPACE_ENV}") {
-                    sh 'terraform init -reconfigure'
-                    sh "terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}"
-                }
-            }
-        }
-
-        stage('Terraform Apply') {
-            steps {
-                dir("terraform/envs/${env.WORKSPACE_ENV}") {
-                    sh "terraform apply -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'"
+                    sh """
+                    terraform init -reconfigure
+                    terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
+                    terraform apply -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
+                    """
                 }
             }
         }
@@ -114,27 +119,42 @@ pipeline {
         }
 
         stage('Deploy Node App to EKS') {
-			steps {
-				dir("k8s/${env.WORKSPACE_ENV}") {
-					sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
-            		sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
-				}
-			}
-		}
+            steps {
+                dir("k8s/${env.WORKSPACE_ENV}") {
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
+                }
+            }
+        }
 
         stage('Verify Deployment') {
-			steps {
-				script {
-					echo "Verifying deployment in ${env.WORKSPACE_ENV} environment..."
-					sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get pods -o wide"
-					sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc"
-				}
-			}
-		}
+            steps {
+                script {
+                    echo "Verifying deployment in ${env.WORKSPACE_ENV} environment..."
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get pods -o wide"
+                    sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc"
+                }
+            }
+        }
     }
 
     post {
-        success { echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME}!" }
-        failure { echo "❌ Pipeline failed for branch ${env.BRANCH_NAME}!" }
+        success {
+            echo "✅ Pipeline succeeded for ${env.WORKSPACE_ENV} (${env.BRANCH_NAME})!"
+        }
+
+        failure {
+            echo "❌ Pipeline failed! Initiating rollback cleanup..."
+            dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                sh """
+                terraform init -reconfigure
+                terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}' || echo 'Rollback cleanup failed but continuing...'
+                """
+            }
+        }
+
+        always {
+            echo "📋 Pipeline finished for ${env.BRANCH_NAME}"
+        }
     }
 }
