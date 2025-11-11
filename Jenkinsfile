@@ -66,8 +66,11 @@ pipeline {
                             terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
                             """
                         }
-                        currentBuild.result = 'SUCCESS'
-                        info("Cluster destroyed. Exiting pipeline as per user request.")
+                        if (params.DESTROY_CLUSTER) {
+                            echo "Cluster destroyed. Exiting pipeline as per user request."
+                            currentBuild.result = 'SUCCESS'
+                            return
+                        }
                     } else if (status != 'NOT_FOUND') {
                         echo "Cluster ${env.CLUSTER_NAME} exists, proceeding with deployment..."
                     } else {
