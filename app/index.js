@@ -3,7 +3,7 @@ const app = express();
 const port = 3000;
 
 app.get('/', (req, res) => {
-  res.send(`Hello from Node.js App in ${process.env.NODE_ENV || 'dev'} environment!`);
+  res.send(`Hello from Node.js App in production environment!`);
 });
 
 app.listen(port, () => {
