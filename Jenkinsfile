@@ -94,11 +94,7 @@ pipeline {
                 dir("terraform/envs/${env.WORKSPACE_ENV}") {
                     sh 'terraform init -reconfigure'
                     sh "terraform workspace select ${env.CLUSTER_NAME} || terraform workspace new ${env.CLUSTER_NAME}"
-                    sh """
-                        terraform apply -auto-approve \
-                        -var='cluster_name=${env.CLUSTER_NAME}' \
-                        -var='region=${env.AWS_REGION}'
-                    """
+                    sh "terraform apply -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'"
                 }
                 sendSlack("✅ Cluster `${env.CLUSTER_NAME}` created successfully!", "#28a745")
             }
@@ -106,12 +102,7 @@ pipeline {
 
         stage('Configure kubeconfig') {
             steps {
-                sh """
-                    aws eks update-kubeconfig \
-                    --name ${env.CLUSTER_NAME} \
-                    --region ${env.AWS_REGION} \
-                    --kubeconfig ${env.KUBECONFIG_PATH}
-                """
+                sh "aws eks update-kubeconfig --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --kubeconfig ${env.KUBECONFIG_PATH}"
             }
         }
 
@@ -146,12 +137,8 @@ pipeline {
             dir("terraform/envs/${env.WORKSPACE_ENV}") {
                 sh """
                     terraform init -reconfigure
-                    terraform workspace select ${env.CLUSTER_NAME} || terraform workspace new ${env.CLUSTER_NAME}
-                    
-                    terraform destroy -auto-approve \
-                      -var='cluster_name=${env.CLUSTER_NAME}' \
-                      -var='region=${env.AWS_REGION}' \
-                      || echo 'No resources to destroy'
+                    terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
+                    terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
                 """
             }
 
