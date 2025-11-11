@@ -49,7 +49,6 @@ pipeline {
                 }
             }
         }
-
         stage('Check & Destroy Cluster (Optional)') {
             steps {
                 script {
@@ -57,30 +56,34 @@ pipeline {
                         script: "aws eks describe-cluster --name ${env.CLUSTER_NAME} --region ${env.AWS_REGION} --query cluster.status --output text || echo NOT_FOUND",
                         returnStdout: true
                     ).trim()
-
-                    if (status != 'NOT_FOUND' && params.DESTROY_CONFIRMATION == 'yes') {
-                        echo "Destroying existing cluster ${env.CLUSTER_NAME} as requested..."
-                        dir("terraform/envs/${env.WORKSPACE_ENV}") {
-                            sh """
-                            terraform init -reconfigure
-                            terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
-                            terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
-                            """
-                        }
-                        if (params.DESTROY_CLUSTER == 'yes') {
-                            echo "Cluster destroyed. Exiting pipeline as per user request."
+        
+                    if (params.DESTROY_CONFIRMATION == 'yes') {
+                        if (status != 'NOT_FOUND') {
+                            echo "Destroying existing cluster ${env.CLUSTER_NAME} as requested..."
+        
+                            dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                                sh """
+                                terraform init -reconfigure
+                                terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
+                                terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
+                                """
+                            }
+        
+                            echo "Cluster destroyed. Stopping pipeline because destroy = yes."
                             currentBuild.result = 'SUCCESS'
-                            return
+                            // STOP PIPELINE EXECUTION
+                            error("Pipeline stopped after destroy as per user request.")
+                        } else {
+                            echo "Cluster not found. Nothing to destroy."
+                            currentBuild.result = 'SUCCESS'
+                            error("Pipeline stopped because destroy = yes but cluster was not found.")
                         }
-                    } else if (status != 'NOT_FOUND') {
-                        echo "Cluster ${env.CLUSTER_NAME} exists, proceeding with deployment..."
-                    } else {
-                        echo "Cluster ${env.CLUSTER_NAME} not found. Ready for creation."
                     }
+        
+                    echo "Destroy not selected. Proceeding with normal deployment."
                 }
             }
         }
-
         stage('Build Node App') {
             steps {
                 dir('app') {
