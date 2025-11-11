@@ -59,6 +59,14 @@ pipeline {
 
                     if (status != 'NOT_FOUND' && params.DESTROY_CONFIRMATION == 'yes') {
                         echo "Destroying existing cluster ${env.CLUSTER_NAME} as requested..."
+                        // Step 1: Delete all LoadBalancer services in all namespaces
+                        sh """
+                        echo "Deleting Kubernetes LoadBalancer services..."
+                        kubectl get svc --all-namespaces -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}:{.metadata.name} {end}' \
+                        | xargs -n1 -r -I{} sh -c 'ns=\$(echo {} | cut -d: -f1); name=\$(echo {} | cut -d: -f2); kubectl delete svc \$name -n \$ns --ignore-not-found'
+                        """
+        
+                        // Step 2: Destroy Terraform-managed resources
                         dir("terraform/envs/${env.WORKSPACE_ENV}") {
                             sh """
                             terraform init -reconfigure
@@ -66,10 +74,17 @@ pipeline {
                             terraform destroy -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${env.AWS_REGION}'
                             """
                         }
-                        if (params.DESTROY_CLUSTER == 'yes') {
-                            echo "Cluster destroyed. Exiting pipeline as per user request."
-                            currentBuild.result = 'SUCCESS'
-                            return
+        
+                        // Step 3: Optionally clean up dangling ENIs (attached to deleted cluster)
+                        sh """
+                        echo "Cleaning up dangling ENIs..."
+                        aws ec2 describe-network-interfaces --filters "Name=description,Values=*eks*" \
+                        --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text | xargs -n1 -r aws ec2 delete-network-interface
+                        """
+        
+                        echo "Cluster and dependent resources destroyed successfully. Exiting pipeline as per user request."
+                        currentBuild.result = 'SUCCESS'
+                        return
                         }
                     } else if (status != 'NOT_FOUND') {
                         echo "Cluster ${env.CLUSTER_NAME} exists, proceeding with deployment..."
