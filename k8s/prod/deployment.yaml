@@ -14,6 +14,6 @@ spec:
     spec:
       containers:
       - name: nodeapp
-        image: yaramprasanthi/nodeapp:prod
+        image: yaramprasanthi/nodeapp:IMAGE_TAG
         ports:
         - containerPort: 3000
