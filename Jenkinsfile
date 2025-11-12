@@ -1,10 +1,20 @@
+// ✅ Slack Notification Helper
+def sendSlack(msg, color = "#36a64f") {
+    withCredentials([string(credentialsId: 'main-branch', variable: 'SLACK_URL')]) {
+        sh """
+            curl -X POST -H 'Content-type: application/json' \
+            --data '{ "attachments": [ { "color": "${color}", "text": "${msg}" } ] }' \
+            $SLACK_URL
+        """
+    }
+}
+
 pipeline {
     agent any
 
     parameters {
         string(name: 'CLUSTER_NAME', defaultValue: '', description: 'EKS cluster name (leave empty to use branch default)')
         string(name: 'REGION', defaultValue: 'ap-south-1', description: 'AWS region')
-        choice(name: 'DESTROY_CONFIRMATION', choices: ['no', 'yes'], description: 'Destroy cluster if exists before deployment?')
     }
 
     environment {
@@ -17,6 +27,14 @@ pipeline {
     }
 
     stages {
+
+        stage('Start Notification') {
+            steps {
+                script {
+                    sendSlack("🚀 *Pipeline Started* for branch `${env.BRANCH_NAME}`", "#439FE0")
+                }
+            }
+        }
 
         stage('Checkout SCM') {
             steps { checkout scm }
@@ -46,7 +64,7 @@ pipeline {
                     env.STABLE_IMAGE  = "yaramprasanthi/nodeapp:stable-${env.WORKSPACE_ENV}"
 
                     echo "Branch: ${env.BRANCH_NAME} → Cluster: ${env.CLUSTER_NAME}, Region: ${params.REGION}"
-                    echo "Current image: ${env.IMAGE_NAME} | Stable: ${env.STABLE_IMAGE}"
+                    sendSlack("🔧 Environment set for `${env.BRANCH_NAME}` → Cluster `${env.CLUSTER_NAME}`", "#439FE0")
                 }
             }
         }
@@ -55,9 +73,10 @@ pipeline {
             steps {
                 dir('app') {
                     sh 'npm install'
-                    script {
-                        docker.build("${env.IMAGE_NAME}")
-                    }
+                    script { docker.build("${env.IMAGE_NAME}") }
+                }
+                script {
+                    sendSlack("📦 Node.js app built successfully → `${env.IMAGE_NAME}`", "#439FE0")
                 }
             }
         }
@@ -71,6 +90,7 @@ pipeline {
                             docker push ${env.IMAGE_NAME}
                         """
                     }
+                    sendSlack("📤 Docker image pushed: `${env.IMAGE_NAME}`", "#439FE0")
                 }
             }
         }
@@ -82,24 +102,27 @@ pipeline {
                     sh "terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}"
                     sh "terraform apply -auto-approve -var='cluster_name=${env.CLUSTER_NAME}' -var='region=${params.REGION}'"
                 }
+                script {
+                    sendSlack("✅ Terraform applied → EKS cluster `${env.CLUSTER_NAME}` created/updated", "#28a745")
+                }
             }
         }
 
         stage('Configure kubeconfig') {
             steps {
                 sh "aws eks update-kubeconfig --name ${env.CLUSTER_NAME} --region ${params.REGION} --kubeconfig ${env.KUBECONFIG_PATH}"
+                script { sendSlack("🔐 Kubeconfig configured for cluster `${env.CLUSTER_NAME}`", "#439FE0") }
             }
         }
 
         stage('Deploy Node App to EKS') {
             steps {
                 dir("k8s/${env.WORKSPACE_ENV}") {
-                    // Ensure deployment/service exists before updating image
                     sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
                     sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
-                    // Update image
                     sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} set image deployment/${env.DEPLOYMENT_NAME} ${env.CONTAINER_NAME}=${env.IMAGE_NAME}"
                 }
+                script { sendSlack("🚀 App deployed to EKS cluster `${env.CLUSTER_NAME}`", "#36a64f") }
             }
         }
 
@@ -115,6 +138,7 @@ pipeline {
                         kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc ${env.SERVICE_NAME} \
                         -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
                     """
+                    sendSlack("🌐 App verified and running on `${env.CLUSTER_NAME}`", "#28a745")
                 }
             }
         }
@@ -122,7 +146,7 @@ pipeline {
         stage('Tag Stable Image') {
             steps {
                 script {
-                    echo "🏷️ Tagging ${env.IMAGE_NAME} as new stable image..."
+                    echo "🏷️ Tagging ${env.IMAGE_NAME} as stable image..."
                     withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
                         sh """
                             echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
@@ -131,6 +155,7 @@ pipeline {
                             docker push ${env.STABLE_IMAGE}
                         """
                     }
+                    sendSlack("🏷️ Tagged new stable image → `${env.STABLE_IMAGE}`", "#28a745")
                 }
             }
         }
@@ -139,19 +164,22 @@ pipeline {
     post {
         success {
             echo "✅ Deployment succeeded for ${env.WORKSPACE_ENV}!"
+            sendSlack("🎉 *SUCCESS* — Deployment completed for `${env.WORKSPACE_ENV}` (`${env.IMAGE_NAME}`)", "#2eb886")
         }
 
         failure {
-            echo "⚠️ FAILURE: Rolling back ${env.WORKSPACE_ENV} environment..."
+            echo "⚠️ FAILURE: Rolling back ${env.WORKSPACE_ENV}..."
             script {
+                sendSlack("❌ *FAILURE* — Rolling back `${env.WORKSPACE_ENV}` to last stable image...", "#ff0000")
+
                 sh "aws eks update-kubeconfig --name ${env.CLUSTER_NAME} --region ${params.REGION} --kubeconfig ${env.KUBECONFIG_PATH}"
                 sh """
                     echo "Attempting rollback to ${env.STABLE_IMAGE}..."
                     kubectl --kubeconfig=${env.KUBECONFIG_PATH} set image deployment/${env.DEPLOYMENT_NAME} ${env.CONTAINER_NAME}=${env.STABLE_IMAGE} || echo 'Rollback failed: deployment not found'
                     kubectl --kubeconfig=${env.KUBECONFIG_PATH} rollout status deployment/${env.DEPLOYMENT_NAME} || echo 'Rollback did not complete properly'
                 """
+                sendSlack("✅ Rollback complete → reverted to `${env.STABLE_IMAGE}`", "#ff9900")
             }
-            echo "✅ Rollback complete — reverted to last stable image: ${env.STABLE_IMAGE}"
         }
     }
 }
