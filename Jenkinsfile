@@ -21,6 +21,10 @@ pipeline {
         AWS_CREDENTIALS = credentials('aws-access-key')
         AWS_REGION = "${params.REGION}"
         DOCKERHUB_CRED = credentials('dockerhub-creds')
+        DEPLOYMENT_NAME = "nodeapp"
+        SERVICE_NAME = "nodeapp-service"
+        CONTAINER_NAME = "nodeapp"
+        TF_BASE = "terraform/envs"
     }
 
     stages {
@@ -34,15 +38,15 @@ pipeline {
             }
         }
 
+        // ✅ Checkout the repository
         stage('Checkout SCM') {
             steps { checkout scm }
         }
 
+        // ✅ Environment setup based on branch
         stage('Set Environment Based on Branch') {
             steps {
                 script {
-
-                    // ✅ Set environment workspace (ALLOWED BY TERRAFORM)
                     if (env.BRANCH_NAME == "dev") {
                         env.WORKSPACE_ENV = "dev"
                         env.DEFAULT_CLUSTER_NAME = "eks-dev"
@@ -59,10 +63,10 @@ pipeline {
                         env.KUBECONFIG_PATH = "/var/lib/jenkins/.kube/eks-prod-config"
 
                     } else {
-                        error("Unknown branch: ${env.BRANCH_NAME}")
+                        error("❌ Unknown branch: ${env.BRANCH_NAME}")
                     }
 
-                    // ✅ Cluster name used in Terraform variables (hyphens allowed here)
+                    // Assign final cluster name (either param or default)
                     env.CLUSTER_NAME = params.CLUSTER_NAME?.trim() ?: env.DEFAULT_CLUSTER_NAME
 
                     sendSlack("🔧 Environment set: `${env.WORKSPACE_ENV}` → Cluster `${env.CLUSTER_NAME}`", "#439FE0")
@@ -70,16 +74,19 @@ pipeline {
             }
         }
 
+
+        // ✅ Build the Node.js application and Docker image
         stage('Build Node App') {
             steps {
                 dir('app') {
                     sh 'npm install'
                     script { docker.build("yaramprasanthi/nodeapp:${env.WORKSPACE_ENV}") }
                 }
-                sendSlack("📦 Node app build completed for `${env.WORKSPACE_ENV}`", "#439FE0")
+                sendSlack("📦 Node.js app built successfully for `${env.WORKSPACE_ENV}`", "#439FE0")
             }
         }
 
+        // ✅ Push Docker image to DockerHub
         stage('Push Docker Image') {
             steps {
                 script {
@@ -87,20 +94,18 @@ pipeline {
                         docker.image("yaramprasanthi/nodeapp:${env.WORKSPACE_ENV}").push()
                     }
                 }
-                sendSlack("📤 Docker image pushed for `${env.WORKSPACE_ENV}`", "#439FE0")
+                sendSlack("📤 Docker image pushed to DockerHub for `${env.WORKSPACE_ENV}`", "#439FE0")
             }
         }
 
-        // ✅ Create Cluster Only (NO destroy logic)
+        // ✅ Terraform Apply (Provision/Update Production Cluster)
         stage('Terraform Init & Apply (Create Cluster)') {
             steps {
-                dir("terraform/envs/${env.WORKSPACE_ENV}") {
+                dir("${env.TF_BASE}/${env.WORKSPACE_ENV}") {
 
-                    // ✅ Correct workspace usage (no hyphens)
                     sh 'terraform init -reconfigure'
                     sh "terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}"
 
-                    // ✅ Create cluster
                     sh """
                         terraform apply -auto-approve \
                           -var='cluster_name=${env.CLUSTER_NAME}' \
@@ -108,10 +113,11 @@ pipeline {
                     """
                 }
 
-                sendSlack("✅ Cluster `${env.CLUSTER_NAME}` created successfully!", "#28a745")
+                sendSlack("✅ Cluster `${env.CLUSTER_NAME}` created/updated successfully via Terraform.", "#28a745")
             }
         }
 
+        // ✅ Configure Kubeconfig
         stage('Configure kubeconfig') {
             steps {
                 sh """
@@ -120,40 +126,53 @@ pipeline {
                         --region ${env.AWS_REGION} \
                         --kubeconfig ${env.KUBECONFIG_PATH}
                 """
+                sendSlack("🔐 kubeconfig configured for `${env.CLUSTER_NAME}`", "#439FE0")
             }
         }
 
+        // 🚦 Manual Approval before Production Deployment
+        stage('Approval Before Production Deployment') {
+            when { expression { env.BRANCH_NAME == "main" } }
+            steps {
+                script {
+                    input message: "🚨 Approve deployment to PRODUCTION cluster `${env.CLUSTER_NAME}`?", ok: "Deploy Now"
+                    sendSlack("✅ Production deployment approved for cluster `${env.CLUSTER_NAME}`", "#439FE0")
+                }
+            }
+        }
+
+        // ✅ Deploy application manifests to EKS
         stage('Deploy Node App to EKS') {
             steps {
                 dir("k8s/${env.WORKSPACE_ENV}") {
                     sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f deployment.yaml"
                     sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} apply -f service.yaml"
                 }
-                sendSlack("🚀 Application deployed to cluster `${env.CLUSTER_NAME}`", "#36a64f")
+                sendSlack("🚀 Application deployed to production cluster `${env.CLUSTER_NAME}`", "#36a64f")
             }
         }
 
+        // ✅ Verify deployment health and service exposure
         stage('Verify Deployment') {
             steps {
                 sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get pods -o wide"
                 sh "kubectl --kubeconfig=${env.KUBECONFIG_PATH} get svc"
-                sendSlack("✅ Deployment verified for cluster `${env.CLUSTER_NAME}`", "#28a745")
+                sendSlack("✅ Deployment verification successful for `${env.CLUSTER_NAME}`", "#28a745")
             }
         }
     }
 
     post {
-
-        // ✅ SUCCESS 
+        // ✅ SUCCESS NOTIFICATION
         success {
-            sendSlack("🎉 *Pipeline Success* for `${env.BRANCH_NAME}`", "#2eb886")
+            sendSlack("🎉 *SUCCESS* — Production deployment completed successfully for `${env.BRANCH_NAME}`", "#2eb886")
         }
 
-        // ✅ FAILURE — clean only partially created cluster
+        // ⚠️ FAILURE HANDLER — clean up partially created resources
         failure {
-            sendSlack("❌ *Pipeline FAILED* for `${env.BRANCH_NAME}` — starting cleanup…", "#ff0000")
+            sendSlack("❌ *FAILURE* — Production pipeline failed for `${env.BRANCH_NAME}`. Starting cleanup...", "#ff0000")
 
-            dir("terraform/envs/${env.WORKSPACE_ENV}") {
+            dir("${env.TF_BASE}/${env.WORKSPACE_ENV}") {
                 sh """
                     terraform init -reconfigure
                     terraform workspace select ${env.WORKSPACE_ENV} || terraform workspace new ${env.WORKSPACE_ENV}
