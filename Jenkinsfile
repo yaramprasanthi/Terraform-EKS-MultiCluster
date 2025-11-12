@@ -1,6 +1,6 @@
 // ✅ Slack Notification Helper
 def sendSlack(msg, color = "#36a64f") {
-    withCredentials([string(credentialsId: 'main-branch', variable: 'SLACK_URL')]) {
+    withCredentials([string(credentialsId: 'dev-branch', variable: 'SLACK_URL')]) {
         sh """
             curl -X POST -H 'Content-type: application/json' \
             --data '{ "attachments": [ { "color": "${color}", "text": "${msg}" } ] }' \
